@@ -15,7 +15,7 @@ index_path = "data/sample_indices.npy"
 if os.path.exists(index_path):
     indices = np.load(index_path)
 else:
-    indices = np.random.RandomState(42).choice(len(df),size=1000,replace=False)
+    indices = np.random.RandomState(42).choice(len(df),size=10000,replace=False)
     np.save(index_path,indices)
 
 df_sample = df.iloc[indices].reset_index(drop=True)
