@@ -88,7 +88,7 @@ class SudokuEnv:
         self.puzzles = puzzles
         self.state = None
         self.steps = 0
-        self.max_steps = 200
+        self.max_steps = 80
 
     def reset(self, idx=None):
         if idx is None:
@@ -105,13 +105,13 @@ class SudokuEnv:
 
         # 불법 행동
         if not is_valid_move(self.state, i, j, k):
-            return self.state.copy(), -1.0, False, {}
+            return self.state.copy(), -2.0, False, {}
 
         # 합법 → 놓기
         self.state[i, j] = k
         # 완성 보상/종료
         if is_solved(self.state):
-            return self.state.copy(), +10.0, True, {}
+            return self.state.copy(), +5.0, True, {}
 
         # 스텝 초과로 에피소드 중단
         done = self.steps >= self.max_steps
@@ -123,9 +123,9 @@ class SudokuEnv:
 def build_qnet():
     # 입력: 81차원(0~9). 간단히 정규화해서 사용.
     inputs = keras.layers.Input(shape=(81,), dtype=tf.float32)
-    x = keras.layers.Normalization()(inputs)  # 내부적으로 mean/std 추정(첫 fit에서 학습됨)
-    x = keras.layers.Dense(512, activation="elu")(x)
-    x = keras.layers.Dense(512, activation="elu")(x)
+    x = inputs  #정규화는 이미 함
+    x = keras.layers.Dense(256, activation="elu")(x)
+    x = keras.layers.Dense(256, activation="elu")(x)
     outputs = keras.layers.Dense(729, activation=None)(x)  # 각 액션의 Q값
     model = keras.Model(inputs, outputs)
     return model
@@ -152,10 +152,10 @@ def epsilon_greedy_action(model, state, mask, epsilon):
 # =========================
 batch_size = 64
 gamma = 0.95
-optimizer = keras.optimizers.Nadam(learning_rate=1e-3)
+optimizer = keras.optimizers.Nadam(learning_rate=1e-4)
 loss_fn = keras.losses.MeanSquaredError()
 
-replay_buffer = deque(maxlen=20000)
+replay_buffer = deque(maxlen=8000)
 
 def play_one_step(env, model, state, epsilon):
     mask = legal_action_mask(state)
@@ -183,9 +183,10 @@ def training_step(model, target_model):
     states, actions, rewards, next_states, dones, next_masks = sample_experiences(batch_size)
 
     # 다음 상태의 Q값 (target net)
-    next_q = target_model.predict(next_states, verbose=0)  # (B,729)
+    next_q = target_model(next_states, training=False).numpy()  # (B,729)
     # 불법 액션 마스킹
-    next_q[next_masks == 0.0] = -1e9
+    for i in range(len(next_q)):
+        next_q[i][next_masks[i] == 0.0] = -1e9
     max_next_q = np.max(next_q, axis=1)  # (B,)
 
     # DQN 타깃
@@ -198,13 +199,14 @@ def training_step(model, target_model):
         q_selected = tf.reduce_sum(all_q * action_onehot, axis=1)   # (B,)
         loss = tf.reduce_mean(loss_fn(target_q_for_actions, q_selected))
     grads = tape.gradient(loss, model.trainable_variables)
+    grads = [tf.clip_by_norm(g,1.0) for g in grads]#클리핑 추가함#exploding gd하기 않기 위함
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
     return float(loss)
 
 # =========================
 # 8) 학습 루프
 # =========================
-def train_rl_only(num_episodes=500, warmup_episodes=30, target_sync_every=10):
+def train_rl_only(num_episodes=200, warmup_episodes=30, target_sync_every=15):
     X_train, *_ = load_dataset()
     env = SudokuEnv(X_train)
 
@@ -223,7 +225,7 @@ def train_rl_only(num_episodes=500, warmup_episodes=30, target_sync_every=10):
         ep_reward = 0.0
 
         # 에피소드마다 epsilon 선형 감소
-        epsilon = max(eps_end, eps_start - (eps_start - eps_end) * (episode / eps_decay_ep))
+        epsilon = max(eps_end, eps_start - (eps_start - eps_end) * (episode / num_episodes)) #epsilon 너무 빨리 감소하지 않게 바꿈
 
         for step in range(env.max_steps):
             state, r, done = play_one_step(env, qnet, state, epsilon)
@@ -235,8 +237,9 @@ def train_rl_only(num_episodes=500, warmup_episodes=30, target_sync_every=10):
 
         # 워밍업 이후부터 학습
         if episode > warmup_episodes and len(replay_buffer) >= batch_size:
-            loss = training_step(qnet, target_qnet)
-            loss_hist.append(loss)
+            if episode%3 ==0:#3번마다 1번 업데이트로 바꿈
+                loss = training_step(qnet, target_qnet)
+                loss_hist.append(loss)
 
         # 타깃 네트워크 주기적 동기화
         if episode % target_sync_every == 0:
@@ -310,7 +313,7 @@ def plot_and_save_curves(rewards, losses, save_dir="output"):
 # 11) 실행
 # =========================
 if __name__ == "__main__":
-    qnet, rewards, losses = train_rl_only(num_episodes=500)
+    qnet, rewards, losses = train_rl_only(num_episodes=200)
 
     # 테스트 평가
     _, _, _, _, X_test, _ = load_dataset()
