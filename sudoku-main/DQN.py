@@ -198,6 +198,12 @@ def training_step(model, target_model):
         action_onehot = tf.one_hot(actions, 729, dtype=tf.float32)  # (B,729)
         q_selected = tf.reduce_sum(all_q * action_onehot, axis=1)   # (B,)
         loss = tf.reduce_mean(loss_fn(target_q_for_actions, q_selected))
+        if loss > 1e6:
+            print("LOSS EXPLODED:", loss)
+            print("targets:", target_q_for_actions[:10])
+            print("q_selected:", q_selected[:10])
+
+
     grads = tape.gradient(loss, model.trainable_variables)
     grads = [tf.clip_by_norm(g,1.0) for g in grads]#클리핑 추가함#exploding gd하기 않기 위함
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
