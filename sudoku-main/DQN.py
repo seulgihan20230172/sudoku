@@ -1,12 +1,25 @@
 import os, math, random
 from collections import deque
-
+import argparse
 import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 import matplotlib.pyplot as plt
 import os
 
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="train",
+        choices=["train", "eval"],
+        help="train or eval"
+    )
+    return parser.parse_args()
+
+illegal_action_count = 0#불법 액션 탐지
 # =========================
 # 1) 데이터 로드 (공통 세트)
 # =========================
@@ -101,21 +114,30 @@ class SudokuEnv:
         """action: 0..728 -> (i,j,k)"""
         self.steps += 1
         i, j, k = id_to_action(action)
-        reward = -0.01  # 진행 패널티
+        
 
         # 불법 행동
         if not is_valid_move(self.state, i, j, k):
             return self.state.copy(), -2.0, False, {}
 
         # 합법 → 놓기
+        prev_filled = np.count_nonzero(self.state)
         self.state[i, j] = k
+        new_filled = np.count_nonzero(self.state)
+        '''
+        fill_bonus = 0.05* (new_filled - prev_filled)#수정 보드에 칸 채워질때
+        step_reward = 0.03
+        reward = fill_bonus + step_reward
+        '''
+        reward = -0.01
         # 완성 보상/종료
         if is_solved(self.state):
-            return self.state.copy(), +5.0, True, {}
+            reward += 5.0
+            return self.state.copy(), reward, True, {}
 
         # 스텝 초과로 에피소드 중단
         done = self.steps >= self.max_steps
-        return self.state.copy(), (reward + 0.1), done, {}
+        return self.state.copy(), (reward + 0.1) , done, {}
 
 # =========================
 # 5) DQN 네트워크 (CNN 없이)
@@ -198,11 +220,12 @@ def training_step(model, target_model):
         action_onehot = tf.one_hot(actions, 729, dtype=tf.float32)  # (B,729)
         q_selected = tf.reduce_sum(all_q * action_onehot, axis=1)   # (B,)
         loss = tf.reduce_mean(loss_fn(target_q_for_actions, q_selected))
+        '''
         if loss > 1e6:
             print("LOSS EXPLODED:", loss)
             print("targets:", target_q_for_actions[:10])
             print("q_selected:", q_selected[:10])
-
+        '''
 
     grads = tape.gradient(loss, model.trainable_variables)
     grads = [tf.clip_by_norm(g,1.0) for g in grads]#클리핑 추가함#exploding gd하기 않기 위함
@@ -219,6 +242,8 @@ def train_rl_only(num_episodes=200, warmup_episodes=30, target_sync_every=15):
     qnet = build_qnet()
     target_qnet = build_qnet()
     target_qnet.set_weights(qnet.get_weights())  # 초기 동기화
+
+    os.makedirs("checkpoints", exist_ok=True)
 
     eps_start, eps_end = 1.0, 0.05
     eps_decay_ep = max(1, num_episodes // 2)
@@ -251,6 +276,11 @@ def train_rl_only(num_episodes=200, warmup_episodes=30, target_sync_every=15):
         if episode % target_sync_every == 0:
             target_qnet.set_weights(qnet.get_weights())
 
+        if episode % 50 == 0:
+            ckpt_path = f"checkpoints/DQN_ep{episode}.weights.h5"
+            qnet.save_weights(ckpt_path)
+            print(f"Checkpoint saved: {ckpt_path}")
+
         if episode % 20 == 0:
             print(f"[Ep {episode:4d}] reward={ep_reward:7.3f}  eps={epsilon:.3f}  buffer={len(replay_buffer)}")
 
@@ -259,32 +289,126 @@ def train_rl_only(num_episodes=200, warmup_episodes=30, target_sync_every=15):
 # =========================
 # 9) 평가 (탐욕 정책, 마스크 적용)
 # =========================
+'''
 def greedy_action(model, state):
+    global illegal_action_count
     mask = legal_action_mask(state)
     s = state.reshape(1, -1) / 9.0
     q = model.predict(s, verbose=0)[0]
+    
     q[mask == 0.0] = -1e9
-    return int(np.argmax(q))
+    a = int(np.argmax(q))
 
-def evaluate(model, puzzles, max_episodes=100):
+    illegal = (mask[a] == 0 or q[a] <= -1e8)
+
+    if illegal:
+        illegal_action_count += 1
+        legal_q = q.copy()
+        legal_q[mask == 0] = -1e9
+        a = int(np.argmax(legal_q))
+        #print(f"[EVAL] ILLEGAL ACTION SELECTED! action={a}, q={q[a]:.2f}")
+
+    return a, illegal
+'''
+def greedy_action(model, state):
+    global illegal_action_count
+    
+    mask = legal_action_mask(state)
+    s = state.reshape(1, -1) / 9.0
+    q = model.predict(s, verbose=0)[0]
+
+    # 모델이 원래 선택하려 했던 action (raw argmax)
+    raw_a = int(np.argmax(q))
+    raw_illegal = (mask[raw_a] == 0)
+
+    # 실제 사용할 action = 무조건 legal 중에서 선택
+    legal_ids = np.where(mask > 0)[0]
+
+    if len(legal_ids) == 0:
+        # 모든 액션이 illegal인 비정상 상황 방지용
+        illegal_action_count += 1
+        return np.random.randint(729), True
+
+    # legal Q만 고려해서 argmax
+    legal_a = legal_ids[np.argmax(q[legal_ids])]
+
+    # illegal 카운트 증가 (raw 선택이 illegal이었는가?)
+    if raw_illegal:
+        illegal_action_count += 1
+
+    return int(legal_a), raw_illegal
+
+def evaluate(model, puzzles, max_episodes=100, save_dir="best_sudoku"):
     env = SudokuEnv(puzzles)
     solved = 0
+    illegal_streak = 0
+
+    os.makedirs("output", exist_ok=True)
+
+    best_reward = -1e9
+    best_board = None
+    best_ep = -1
+
     for ep in range(min(max_episodes, len(puzzles))):
         state = env.reset(idx=ep)
         done = False
-        for _ in range(env.max_steps):
-            a = greedy_action(model, state)
-            state, r, done, _ = env.step(a)
+        total_r = 0
+
+        while True:
+            a,illegal = greedy_action(model, state)
+            next_state, r, done, _ = env.step(a)
+
+            if illegal:
+                illegal_streak +=1
+                if illegal_streak >= 5:
+                    break
+            else: 
+                illegal_streak=0
+
+            total_r += r
+            state = next_state
             if done:
                 break
+
         if is_solved(state):
             solved += 1
-    print(f"Evaluation: solved {solved}/{min(max_episodes, len(puzzles))} puzzles")
+
+        if total_r > best_reward:
+            best_reward = total_r
+            best_board = state.copy()
+            best_ep = ep
+    
+    save_path = f"{save_dir}/best_reward_ep{best_ep}.png"
+    save_sudoku_image(best_board, save_path)
+
+    with open(f"{save_dir}/best_reward_info.txt", "w") as f:
+        f.write(f"episode: {best_ep}\nreward: {best_reward}\nboard:\n{best_board}")
+
+    print(f"Total illegal: {illegal_action_count}")
+    print(f"Solved: {solved}/{max_episodes}")
+    
     return solved
 
 # =========================
 # 10) 학습 결과 시각화 및 저장
 # =========================
+def save_sudoku_image(board, path):
+    plt.figure(figsize=(4, 4))
+    plt.imshow(np.zeros((9, 9)), cmap="gray_r")  # 그냥 배경
+    plt.xticks(range(9))
+    plt.yticks(range(9))
+    plt.grid(True)
+
+    for i in range(9):
+        for j in range(9):
+            num = board[i, j]
+            if num != 0:
+                plt.text(j, i, str(num), ha="center", va="center", fontsize=16)
+
+    plt.title("Sudoku Board")
+    plt.savefig(path)
+    plt.close()
+
 
 def plot_and_save_curves(rewards, losses, save_dir="output"):
     os.makedirs(save_dir, exist_ok=True)  # 폴더 없으면 자동 생성
@@ -319,11 +443,35 @@ def plot_and_save_curves(rewards, losses, save_dir="output"):
 # 11) 실행
 # =========================
 if __name__ == "__main__":
-    qnet, rewards, losses = train_rl_only(num_episodes=200)
+    args = parse_args()
+    import glob
+    import os
 
-    # 테스트 평가
+    # load test set
     _, _, _, _, X_test, _ = load_dataset()
-    evaluate(qnet, X_test, max_episodes=100)
+    
+    if args.mode == "train":
+        print("=== TRAINING START ===")
+        qnet, rewards, losses = train_rl_only(num_episodes=200)
 
-    # 그래프 저장
-    plot_and_save_curves(rewards, losses, save_dir="output")
+        plot_and_save_curves(rewards, losses, save_dir="output")
+        print("=== TRAINING DONE ===")
+
+    elif args.mode == "eval":
+        print("=== EVALUATION START ===")
+        ckpt_list = sorted(glob.glob("checkpoints/DQN_ep*.weights.h5"))
+        print("Found checkpoints:", ckpt_list)
+
+        for ckpt in ckpt_list:
+            print(f"\n============================")
+            print(f" Evaluating checkpoint: {ckpt}")
+            print(f"============================")
+            qnet = build_qnet()
+            qnet.load_weights(ckpt)
+            print("Loaded checkpoint")
+            # 평가 결과 저장 폴더 분리
+            ckpt_name = os.path.splitext(os.path.basename(ckpt))[0]
+            save_dir = f"best_sudoku/{ckpt_name}"
+            os.makedirs(save_dir, exist_ok=True)
+            evaluate(qnet, X_test, max_episodes=100, save_dir=save_dir)
+        print("=== EVALUATION DONE ===")
