@@ -327,6 +327,22 @@ def evaluate(model, dl, device, crit):
     return avg_loss, blank_acc, cell_acc, puzzle_full_acc, puzzle_blank_acc
 
 
+def save_checkpoint(path, model, opt, sched, epoch, best_metric, args):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "scheduler_state_dict": sched.state_dict() if sched else None,
+            "best_val_puzzle": best_metric,
+            "args": vars(args),
+        },
+        path,
+    )
+    print(f"checkpoint saved: {path}")
+
+
 # ======================
 # CLI
 # ======================
@@ -359,6 +375,24 @@ def parse_args():
         type=str,
         default="",
         help="PNG path to save curves (requires matplotlib)",
+    )
+    p.add_argument(
+        "--save-dir",
+        type=str,
+        default="runs/ckpt",
+        help="directory to save checkpoints",
+    )
+    p.add_argument(
+        "--save-every",
+        type=int,
+        default=0,
+        help="save checkpoint every N epochs (0 to disable)",
+    )
+    p.add_argument(
+        "--name",
+        type=str,
+        default="stan",
+        help="prefix for checkpoint filenames",
     )
     return p.parse_args()
 
@@ -398,6 +432,8 @@ def main():
     crit = nn.CrossEntropyLoss(reduction="none")  # per-cell loss (masking/가중치용)
 
     history = []
+    best_val_puzzle = -1.0
+    save_dir = Path(args.save_dir)
     try:
         for ep in range(epochs):
             tr_loss, tr_blank, tr_cell, tr_puzzle, tr_puzzle_blank = train_epoch(
@@ -431,9 +467,43 @@ def main():
                 f"val_blank {va_blank:.4f} | val_cell {va_cell:.4f} | "
                 f"val_puzzle {va_puzzle:.4f}"
             )
+
+            # checkpointing
+            ep_num = ep + 1
+            if va_puzzle > best_val_puzzle:
+                best_val_puzzle = va_puzzle
+                save_checkpoint(
+                    save_dir / f"{args.name}_best.pt",
+                    model,
+                    opt,
+                    sched,
+                    ep_num,
+                    best_val_puzzle,
+                    args,
+                )
+            if args.save_every > 0 and ep_num % args.save_every == 0:
+                save_checkpoint(
+                    save_dir / f"{args.name}_ep{ep_num:03d}.pt",
+                    model,
+                    opt,
+                    sched,
+                    ep_num,
+                    best_val_puzzle,
+                    args,
+                )
     except KeyboardInterrupt:
         print("\nTraining interrupted. Returning current model.")
     finally:
+        if history:
+            save_checkpoint(
+                save_dir / f"{args.name}_last.pt",
+                model,
+                opt,
+                sched,
+                len(history),
+                best_val_puzzle,
+                args,
+            )
         if args.log_csv and history:
             path = Path(args.log_csv)
             path.parent.mkdir(parents=True, exist_ok=True)
